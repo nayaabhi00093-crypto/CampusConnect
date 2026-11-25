@@ -9,3 +9,24 @@ verified_students.csv
 .env
 .venv/
 venv/
+
+# Local backups
+local_backup_before_cloud/
+database_before_postgres.py
+campusconnect_backup_before_cloud.db
+
+# Secrets
+.streamlit/secrets.toml
+
+# Local backups
+local_backup_before_cloud/
+database_before_postgres.py
+campusconnect_backup_before_cloud.db
+
+# Secrets
+.streamlit/secrets.toml
+
+# One-time migration and testing scripts
+migrate_images_to_supabase.py
+migrate_to_supabase.py
+test_supabase.py

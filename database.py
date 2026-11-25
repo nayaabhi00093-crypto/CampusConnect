@@ -1,208 +1,84 @@
 
-import sqlite3
 import hashlib
 import hmac
 import secrets
 import re
 import csv
 import io
+import tomllib
 from pathlib import Path
 from datetime import datetime
+from contextlib import contextmanager
+
+import psycopg
 
 
-# Keep the database inside the project folder
+# =========================================================
+# CONFIGURATION AND DATABASE CONNECTION
+# =========================================================
+
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "campusconnect.db"
+SECRETS_PATH = BASE_DIR / ".streamlit" / "secrets.toml"
+
+
+def _get_database_settings():
+    """Read database credentials from Streamlit secrets or local TOML."""
+
+    try:
+        import streamlit as st
+        settings = st.secrets.get("database", {})
+        if settings and settings.get("host"):
+            return dict(settings)
+    except Exception:
+        pass
+
+    if SECRETS_PATH.exists():
+        with open(SECRETS_PATH, "rb") as file:
+            secrets_data = tomllib.load(file)
+        return secrets_data["database"]
+
+    raise RuntimeError(
+        "Database configuration is missing. "
+        "Configure the database section in Streamlit secrets."
+    )
 
 
 def connect_db():
-    connection = sqlite3.connect(str(DB_PATH))
-    connection.execute("PRAGMA foreign_keys = ON")
-    return connection
+    """Connect to the Supabase PostgreSQL database."""
+
+    settings = _get_database_settings()
+
+    return psycopg.connect(
+        host=settings["host"],
+        port=int(settings["port"]),
+        dbname=settings["dbname"],
+        user=settings["user"],
+        password=settings["password"],
+        sslmode=settings.get("sslmode", "require"),
+        connect_timeout=15
+    )
 
 
-# =========================================================
-# DATABASE INITIALIZATION AND SAFE MIGRATIONS
-# =========================================================
+@contextmanager
+def _db():
+    """Manage a database connection and transaction safely."""
+
+    connection = connect_db()
+
+    try:
+        with connection.transaction():
+            yield connection
+    finally:
+        connection.close()
+
 
 def create_tables():
-    connection = connect_db()
-    cursor = connection.cursor()
+    """
+    Supabase tables were already created and migrated.
+    Do not recreate or alter the cloud schema.
+    """
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS students (
-            username TEXT PRIMARY KEY,
-            password TEXT NOT NULL,
-            name TEXT NOT NULL,
-            programme TEXT,
-            year INTEGER,
-            bio TEXT,
-            skills TEXT,
-            profile_picture TEXT
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS connections (
-            student1 TEXT NOT NULL,
-            student2 TEXT NOT NULL,
-            PRIMARY KEY (student1, student2),
-            CHECK (student1 < student2),
-            FOREIGN KEY (student1) REFERENCES students(username),
-            FOREIGN KEY (student2) REFERENCES students(username)
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS pending_requests (
-            sender TEXT NOT NULL,
-            receiver TEXT NOT NULL,
-            PRIMARY KEY (sender, receiver),
-            CHECK (sender != receiver),
-            FOREIGN KEY (sender) REFERENCES students(username),
-            FOREIGN KEY (receiver) REFERENCES students(username)
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS posts (
-            post_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL,
-            content TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            image_path TEXT,
-            FOREIGN KEY (username) REFERENCES students(username)
-        )
-    """)
-
-    # FIXED: closing parenthesis added
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS post_likes (
-            post_id INTEGER NOT NULL,
-            username TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            PRIMARY KEY (post_id, username),
-            FOREIGN KEY (post_id) REFERENCES posts(post_id)
-                ON DELETE CASCADE,
-            FOREIGN KEY (username) REFERENCES students(username)
-                ON DELETE CASCADE
-        )
-    """)
-
-    # FIXED: closing parenthesis added
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS post_comments (
-            comment_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            post_id INTEGER NOT NULL,
-            username TEXT NOT NULL,
-            comment_text TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY (post_id) REFERENCES posts(post_id)
-                ON DELETE CASCADE,
-            FOREIGN KEY (username) REFERENCES students(username)
-                ON DELETE CASCADE
-        )
-    """)
-
-    # Add new student fields safely to existing database
-    student_columns = {
-        row[1]
-        for row in cursor.execute(
-            "PRAGMA table_info(students)"
-        ).fetchall()
-    }
-
-    if "profile_picture" not in student_columns:
-        cursor.execute("""
-            ALTER TABLE students
-            ADD COLUMN profile_picture TEXT
-        """)
-
-    if "registration_number" not in student_columns:
-        cursor.execute("""
-            ALTER TABLE students
-            ADD COLUMN registration_number TEXT
-        """)
-
-    if "category" not in student_columns:
-        cursor.execute("""
-            ALTER TABLE students
-            ADD COLUMN category TEXT DEFAULT 'UG'
-        """)
-
-    if "verified" not in student_columns:
-        cursor.execute("""
-            ALTER TABLE students
-            ADD COLUMN verified INTEGER DEFAULT 0
-        """)
-
-    post_columns = {
-        row[1]
-        for row in cursor.execute(
-            "PRAGMA table_info(posts)"
-        ).fetchall()
-    }
-
-    if "image_path" not in post_columns:
-        cursor.execute("""
-            ALTER TABLE posts
-            ADD COLUMN image_path TEXT
-        """)
-
-    # Admin accounts
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS admins (
-            admin_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )
-    """)
-
-    # Official records uploaded by authorized admin
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS verified_students (
-            registration_number TEXT PRIMARY KEY,
-            full_name TEXT NOT NULL,
-            category TEXT NOT NULL,
-            joining_year INTEGER,
-            registered_username TEXT UNIQUE,
-            imported_at TEXT NOT NULL
-        )
-    """)
-
-    # Audit records; do not store passwords
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS verification_logs (
-            log_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            registration_number TEXT,
-            category TEXT,
-            result TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )
-    """)
-
-    cursor.execute("""
-        CREATE UNIQUE INDEX IF NOT EXISTS
-        idx_students_registration_number
-        ON students(registration_number)
-        WHERE registration_number IS NOT NULL
-    """)
-
-    cursor.execute("""
-        CREATE INDEX IF NOT EXISTS
-        idx_posts_created_at
-        ON posts(created_at)
-    """)
-
-    cursor.execute("""
-        CREATE INDEX IF NOT EXISTS
-        idx_comments_post_id
-        ON post_comments(post_id)
-    """)
-
-    connection.commit()
-    connection.close()
+    return True
 
 
 # =========================================================
@@ -225,9 +101,11 @@ def hash_password(password):
 def verify_password(password, stored_password):
     try:
         salt_hex, hash_hex = stored_password.split(":")
-        salt = bytes.fromhex(salt_hex)
 
-        new_hash = hashlib.pbkdf2_hmac(
+        salt = bytes.fromhex(salt_hex)
+        stored_hash = bytes.fromhex(hash_hex)
+
+        calculated_hash = hashlib.pbkdf2_hmac(
             "sha256",
             password.encode("utf-8"),
             salt,
@@ -235,109 +113,97 @@ def verify_password(password, stored_password):
         )
 
         return hmac.compare_digest(
-            new_hash.hex(),
-            hash_hex
+            calculated_hash,
+            stored_hash
         )
 
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, AttributeError):
         return False
 
 
 # =========================================================
-# ADMIN FUNCTIONS
+# ADMIN ACCOUNTS
 # =========================================================
 
 def create_admin(username, password):
-    username = username.strip()
+    username = (username or "").strip()
 
     if not username or len(password) < 8:
         return False
 
-    connection = connect_db()
-    cursor = connection.cursor()
-
     try:
-        cursor.execute("""
-            INSERT INTO admins
-            (username, password_hash, created_at)
-            VALUES (?, ?, ?)
-        """, (
-            username,
-            hash_password(password),
-            datetime.now().isoformat(timespec="seconds")
-        ))
+        with _db() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO admins
+                    (username, password_hash, created_at)
+                    VALUES (%s, %s, %s)
+                """, (
+                    username,
+                    hash_password(password),
+                    datetime.now().isoformat(timespec="seconds")
+                ))
 
-        connection.commit()
         return True
 
-    except sqlite3.IntegrityError:
+    except psycopg.IntegrityError:
         return False
-
-    finally:
-        connection.close()
 
 
 def login_admin(username, password):
-    connection = connect_db()
-    cursor = connection.cursor()
+    try:
+        with _db() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    SELECT password_hash
+                    FROM admins
+                    WHERE username = %s
+                """, ((username or "").strip(),))
 
-    cursor.execute("""
-        SELECT password_hash
-        FROM admins
-        WHERE username = ?
-    """, (username.strip(),))
+                record = cursor.fetchone()
 
-    result = cursor.fetchone()
-    connection.close()
+                return bool(
+                    record
+                    and verify_password(password, record[0])
+                )
 
-    if not result:
+    except psycopg.Error:
         return False
-
-    return verify_password(password, result[0])
 
 
 def get_admins():
-    connection = connect_db()
-    cursor = connection.cursor()
+    with _db() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT username
+                FROM admins
+                ORDER BY username
+            """)
 
-    cursor.execute("""
-        SELECT admin_id, username, created_at
-        FROM admins
-        ORDER BY admin_id
-    """)
-
-    result = cursor.fetchall()
-    connection.close()
-
-    return result
+            return [row[0] for row in cursor.fetchall()]
 
 
 def admin_exists():
-    connection = connect_db()
-    cursor = connection.cursor()
+    with _db() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT EXISTS (
+                    SELECT 1 FROM admins
+                )
+            """)
 
-    cursor.execute("""
-        SELECT COUNT(*)
-        FROM admins
-    """)
-
-    count = cursor.fetchone()[0]
-    connection.close()
-
-    return count > 0
+            return cursor.fetchone()[0]
 
 
 # =========================================================
-# OFFICIAL STUDENT RECORD IMPORT / VERIFICATION
+# STUDENT VERIFICATION
 # =========================================================
 
 CATEGORY_ALIASES = {
     "UG": "UG",
     "UNDERGRADUATE": "UG",
-    "UNDERGRAD": "UG",
     "PG": "PG",
     "POSTGRADUATE": "PG",
-    "POSTGRAD": "PG",
     "DR": "Doctorate",
     "DOCTORATE": "Doctorate",
     "PHD": "Doctorate",
@@ -371,12 +237,11 @@ def validate_registration_format(registration_number, category):
     category = normalize_category(category)
 
     if category in ("UG", "PG", "Doctorate"):
-        pattern = r"^\d{2}(UG|PG|DR)\d{5}$"
-
-        if not re.fullmatch(pattern, registration_number):
+        if not re.fullmatch(
+            r"^\d{2}(UG|PG|DR)\d{5}$",
+            registration_number
+        ):
             return False
-
-        number_category = registration_number[2:4]
 
         expected = {
             "UG": "UG",
@@ -384,7 +249,7 @@ def validate_registration_format(registration_number, category):
             "Doctorate": "DR"
         }
 
-        return number_category == expected[category]
+        return registration_number[2:4] == expected[category]
 
     if category == "Professor":
         return (
@@ -430,7 +295,8 @@ def import_verified_records(csv_text):
 
         for row in reader:
             normalized_row = {
-                (key or "").strip().lower(): (value or "").strip()
+                (key or "").strip().lower():
+                    (value or "").strip()
                 for key, value in row.items()
             }
 
@@ -439,6 +305,7 @@ def import_verified_records(csv_text):
             )
 
             full_name = normalized_row.get("full_name")
+
             category = normalize_category(
                 normalized_row.get("category")
             )
@@ -470,69 +337,44 @@ def import_verified_records(csv_text):
     except Exception as error:
         return 0, [f"Could not read CSV: {error}"]
 
-    connection = connect_db()
-    cursor = connection.cursor()
-
     imported = 0
     errors = []
 
     try:
-        for reg_no, full_name, category, joining_year in rows:
-            cursor.execute("""
-                SELECT registered_username
-                FROM verified_students
-                WHERE registration_number = ?
-            """, (reg_no,))
+        with _db() as connection:
+            with connection.cursor() as cursor:
+                for reg_no, full_name, category, joining_year in rows:
 
-            existing = cursor.fetchone()
-
-            if existing:
-                cursor.execute("""
-                    UPDATE verified_students
-                    SET
-                        full_name = ?,
-                        category = ?,
-                        joining_year = ?,
-                        imported_at = ?
-                    WHERE registration_number = ?
-                """, (
-                    full_name,
-                    category,
-                    joining_year,
-                    datetime.now().isoformat(timespec="seconds"),
-                    reg_no
-                ))
-
-            else:
-                cursor.execute("""
-                    INSERT INTO verified_students
-                    (
-                        registration_number,
+                    cursor.execute("""
+                        INSERT INTO verified_students
+                        (
+                            registration_number,
+                            full_name,
+                            category,
+                            joining_year,
+                            registered_username,
+                            imported_at
+                        )
+                        VALUES (%s, %s, %s, %s, NULL, %s)
+                        ON CONFLICT (registration_number)
+                        DO UPDATE SET
+                            full_name = EXCLUDED.full_name,
+                            category = EXCLUDED.category,
+                            joining_year = EXCLUDED.joining_year,
+                            imported_at = EXCLUDED.imported_at
+                    """, (
+                        reg_no,
                         full_name,
                         category,
                         joining_year,
-                        registered_username,
-                        imported_at
-                    )
-                    VALUES (?, ?, ?, ?, NULL, ?)
-                """, (
-                    reg_no,
-                    full_name,
-                    category,
-                    joining_year,
-                    datetime.now().isoformat(timespec="seconds")
-                ))
+                        datetime.now().isoformat(timespec="seconds")
+                    ))
 
-            imported += 1
+                    imported += 1
 
-        connection.commit()
-
-    except sqlite3.Error as error:
-        connection.rollback()
+    except psycopg.Error as error:
         errors.append(str(error))
-
-    finally:
-        connection.close()
+        imported = 0
 
     return imported, errors
 
@@ -542,24 +384,20 @@ def get_verified_student_record(registration_number):
         registration_number
     )
 
-    connection = connect_db()
-    cursor = connection.cursor()
+    with _db() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT
+                    registration_number,
+                    full_name,
+                    category,
+                    joining_year,
+                    registered_username
+                FROM verified_students
+                WHERE registration_number = %s
+            """, (reg_no,))
 
-    cursor.execute("""
-        SELECT
-            registration_number,
-            full_name,
-            category,
-            joining_year,
-            registered_username
-        FROM verified_students
-        WHERE registration_number = ?
-    """, (reg_no,))
-
-    record = cursor.fetchone()
-    connection.close()
-
-    return record
+            return cursor.fetchone()
 
 
 def verify_registration(registration_number, category, full_name):
@@ -570,80 +408,88 @@ def verify_registration(registration_number, category, full_name):
     category = normalize_category(category)
     full_name = (full_name or "").strip()
 
-    connection = connect_db()
-    cursor = connection.cursor()
-
     record = None
     result = "FAILED"
 
-    if not validate_registration_format(reg_no, category):
-        message = "Registration number format or category is invalid."
+    try:
+        with _db() as connection:
+            with connection.cursor() as cursor:
 
-    else:
-        cursor.execute("""
-            SELECT
-                registration_number,
-                full_name,
-                category,
-                joining_year,
-                registered_username
-            FROM verified_students
-            WHERE registration_number = ?
-        """, (reg_no,))
+                if not validate_registration_format(
+                    reg_no,
+                    category
+                ):
+                    message = (
+                        "Registration number format or "
+                        "category is invalid."
+                    )
 
-        record = cursor.fetchone()
+                else:
+                    cursor.execute("""
+                        SELECT
+                            registration_number,
+                            full_name,
+                            category,
+                            joining_year,
+                            registered_username
+                        FROM verified_students
+                        WHERE registration_number = %s
+                    """, (reg_no,))
 
-        if not record:
-            message = (
-                "Registration number not found in the official "
-                "verification database."
-            )
+                    record = cursor.fetchone()
 
-        elif normalize_category(record[2]) != category:
-            message = (
-                "The selected category does not match the "
-                "official university record."
-            )
+                    if not record:
+                        message = (
+                            "Registration number not found in the "
+                            "official verification database."
+                        )
 
-        elif record[4]:
-            message = (
-                "This registration number has already been used "
-                "to create a CampusConnect account."
-            )
+                    elif normalize_category(record[2]) != category:
+                        message = (
+                            "The selected category does not match "
+                            "the official university record."
+                        )
 
-        elif (
-            record[1].strip().casefold()
-            != full_name.casefold()
-        ):
-            message = (
-                "Name does not match the official university record. "
-                "Please enter your name as registered with the university."
-            )
+                    elif record[4]:
+                        message = (
+                            "This registration number has already "
+                            "been used to create a CampusConnect account."
+                        )
 
-        else:
-            result = "SUCCESS"
-            message = "Student verified successfully."
+                    elif (
+                        record[1].strip().casefold()
+                        != full_name.casefold()
+                    ):
+                        message = (
+                            "Name does not match the official "
+                            "university record. Please enter your "
+                            "name as registered with the university."
+                        )
 
-    cursor.execute("""
-        INSERT INTO verification_logs
-        (
-            registration_number,
-            category,
-            result,
-            created_at
-        )
-        VALUES (?, ?, ?, ?)
-    """, (
-        reg_no,
-        category or "",
-        result,
-        datetime.now().isoformat(timespec="seconds")
-    ))
+                    else:
+                        result = "SUCCESS"
+                        message = "Student verified successfully."
 
-    connection.commit()
-    connection.close()
+                cursor.execute("""
+                    INSERT INTO verification_logs
+                    (
+                        registration_number,
+                        category,
+                        result,
+                        created_at
+                    )
+                    VALUES (%s, %s, %s, %s)
+                """, (
+                    reg_no,
+                    category or "",
+                    result,
+                    datetime.now().isoformat(timespec="seconds")
+                ))
 
-    return result == "SUCCESS", message, record
+        return result == "SUCCESS", message, record
+
+    except psycopg.Error as error:
+        return False, f"Verification could not be completed: {error}", None
 
 
 def complete_verified_registration(
@@ -669,240 +515,239 @@ def complete_verified_registration(
     skills = skills or ""
 
     if not username or len(password) < 8:
-        return False, "Username is required and password must be at least 8 characters."
+        return False, (
+            "Username is required and password must be "
+            "at least 8 characters."
+        )
 
-    connection = connect_db()
-    cursor = connection.cursor()
+    if not validate_registration_format(reg_no, category):
+        return False, "Registration number format or category is invalid."
 
     try:
-        cursor.execute("""
-            SELECT
-                full_name,
-                category,
-                registered_username
-            FROM verified_students
-            WHERE registration_number = ?
-        """, (reg_no,))
+        joining_year = int(year)
+    except (ValueError, TypeError):
+        return False, "Please enter a valid joining year."
 
-        official_record = cursor.fetchone()
+    try:
+        with _db() as connection:
+            with connection.cursor() as cursor:
 
-        if not official_record:
-            return False, "Registration number not found."
+                # Lock the official record to prevent two
+                # simultaneous registrations claiming it.
+                cursor.execute("""
+                    SELECT
+                        full_name,
+                        category,
+                        registered_username
+                    FROM verified_students
+                    WHERE registration_number = %s
+                    FOR UPDATE
+                """, (reg_no,))
 
-        if official_record[2]:
-            return False, "This registration number is already registered."
+                official_record = cursor.fetchone()
 
-        if (
-            official_record[0].strip().casefold()
-            != full_name.casefold()
-        ):
-            return False, "Name does not match official record."
+                if not official_record:
+                    return False, "Registration number not found."
 
-        if normalize_category(official_record[1]) != category:
-            return False, "Category does not match official record."
+                if official_record[2]:
+                    return False, (
+                        "This registration number is already registered."
+                    )
 
-        cursor.execute("""
-            SELECT username
-            FROM students
-            WHERE username = ?
-        """, (username,))
+                if (
+                    official_record[0].strip().casefold()
+                    != full_name.casefold()
+                ):
+                    return False, "Name does not match official record."
 
-        if cursor.fetchone():
-            return False, "Username already exists."
+                if normalize_category(official_record[1]) != category:
+                    return False, (
+                        "Category does not match official record."
+                    )
 
-        hashed_password = hash_password(password)
+                hashed_password = hash_password(password)
 
-        cursor.execute("""
-            INSERT INTO students
-            (
-                username,
-                password,
-                name,
-                programme,
-                year,
-                bio,
-                skills,
-                registration_number,
-                category,
-                verified
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-        """, (
-            username,
-            hashed_password,
-            full_name,
-            programme,
-            int(year),
-            bio,
-            skills,
-            reg_no,
-            category
-        ))
+                cursor.execute("""
+                    INSERT INTO students
+                    (
+                        username,
+                        password,
+                        name,
+                        programme,
+                        year,
+                        bio,
+                        skills,
+                        registration_number,
+                        category,
+                        verified
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 1)
+                """, (
+                    username,
+                    hashed_password,
+                    full_name,
+                    programme,
+                    joining_year,
+                    bio,
+                    skills,
+                    reg_no,
+                    category
+                ))
 
-        cursor.execute("""
-            UPDATE verified_students
-            SET registered_username = ?
-            WHERE registration_number = ?
-            AND registered_username IS NULL
-        """, (username, reg_no))
+                cursor.execute("""
+                    UPDATE verified_students
+                    SET registered_username = %s
+                    WHERE registration_number = %s
+                    AND registered_username IS NULL
+                """, (username, reg_no))
 
-        if cursor.rowcount != 1:
-            raise sqlite3.IntegrityError(
-                "Verification record was already claimed."
-            )
+                if cursor.rowcount != 1:
+                    raise RuntimeError(
+                        "Verification record was already claimed."
+                    )
 
-        connection.commit()
         return True, "Verified account created successfully."
 
-    except sqlite3.IntegrityError as error:
-        connection.rollback()
+    except psycopg.IntegrityError as error:
+        error_text = str(error).lower()
+
+        if "students_pkey" in error_text or "username" in error_text:
+            return False, "Username already exists."
+
+        if "registration_number" in error_text:
+            return False, "This registration number is already registered."
+
         return False, f"Registration failed: {error}"
 
     except Exception as error:
-        connection.rollback()
         return False, f"Registration failed: {error}"
-
-    finally:
-        connection.close()
 
 
 def get_verified_records():
-    connection = connect_db()
-    cursor = connection.cursor()
+    with _db() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT
+                    registration_number,
+                    full_name,
+                    category,
+                    joining_year,
+                    registered_username,
+                    imported_at
+                FROM verified_students
+                ORDER BY registration_number
+            """)
 
-    cursor.execute("""
-        SELECT
-            registration_number,
-            full_name,
-            category,
-            joining_year,
-            registered_username,
-            imported_at
-        FROM verified_students
-        ORDER BY registration_number
-    """)
-
-    records = cursor.fetchall()
-    connection.close()
-
-    return records
+            return cursor.fetchall()
 
 
 def get_verification_logs(limit=100):
-    connection = connect_db()
-    cursor = connection.cursor()
+    with _db() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT
+                    log_id,
+                    registration_number,
+                    category,
+                    result,
+                    created_at
+                FROM verification_logs
+                ORDER BY log_id DESC
+                LIMIT %s
+            """, (int(limit),))
 
-    cursor.execute("""
-        SELECT
-            registration_number,
-            category,
-            result,
-            created_at
-        FROM verification_logs
-        ORDER BY log_id DESC
-        LIMIT ?
-    """, (limit,))
-
-    logs = cursor.fetchall()
-    connection.close()
-
-    return logs
+            return cursor.fetchall()
 
 
 def delete_verified_record(registration_number):
-    connection = connect_db()
-    cursor = connection.cursor()
+    reg_no = normalize_registration_number(
+        registration_number
+    )
 
-    cursor.execute("""
-        DELETE FROM verified_students
-        WHERE registration_number = ?
-        AND registered_username IS NULL
-    """, (normalize_registration_number(registration_number),))
+    with _db() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                DELETE FROM verified_students
+                WHERE registration_number = %s
+                AND registered_username IS NULL
+            """, (reg_no,))
 
-    deleted = cursor.rowcount > 0
-
-    connection.commit()
-    connection.close()
-
-    return deleted
+            return cursor.rowcount > 0
 
 
 # =========================================================
-# STUDENT FUNCTIONS
+# STUDENT ACCOUNTS
 # =========================================================
 
 def add_student(
     username,
     password,
     name,
-    programme,
-    year,
-    bio,
-    skills
+    programme="",
+    year=None,
+    bio="",
+    skills=""
 ):
-    connection = connect_db()
-    cursor = connection.cursor()
+    username = (username or "").strip()
+    name = (name or "").strip()
 
-    try:
-        cursor.execute("""
-            INSERT INTO students
-            (
-                username,
-                password,
-                name,
-                programme,
-                year,
-                bio,
-                skills,
-                category,
-                verified
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'UG', 0)
-        """, (
-            username.strip(),
-            hash_password(password),
-            name.strip(),
-            programme,
-            int(year),
-            bio,
-            skills
-        ))
-
-        connection.commit()
-        return True
-
-    except sqlite3.IntegrityError:
+    if not username or not name or len(password) < 8:
         return False
 
-    finally:
-        connection.close()
+    try:
+        with _db() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO students
+                    (
+                        username,
+                        password,
+                        name,
+                        programme,
+                        year,
+                        bio,
+                        skills,
+                        category,
+                        verified
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, 'UG', 0)
+                """, (
+                    username,
+                    hash_password(password),
+                    name,
+                    programme,
+                    year,
+                    bio,
+                    skills
+                ))
+
+        return True
+
+    except psycopg.IntegrityError:
+        return False
 
 
 def get_student(username):
-    connection = connect_db()
-    cursor = connection.cursor()
+    with _db() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT
+                    username,
+                    password,
+                    name,
+                    programme,
+                    year,
+                    bio,
+                    skills,
+                    profile_picture,
+                    registration_number,
+                    category,
+                    verified
+                FROM students
+                WHERE username = %s
+            """, (username,))
 
-    cursor.execute("""
-        SELECT
-            username,
-            password,
-            name,
-            programme,
-            year,
-            bio,
-            skills,
-            profile_picture,
-            registration_number,
-            category,
-            verified
-        FROM students
-        WHERE username = ?
-    """, (username,))
-
-    student = cursor.fetchone()
-    connection.close()
-
-    return student
+            return cursor.fetchone()
 
 
 def update_student_profile(
@@ -913,171 +758,149 @@ def update_student_profile(
     bio,
     skills
 ):
-    connection = connect_db()
-    cursor = connection.cursor()
+    with _db() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                UPDATE students
+                SET
+                    name = %s,
+                    programme = %s,
+                    year = %s,
+                    bio = %s,
+                    skills = %s
+                WHERE username = %s
+            """, (
+                name,
+                programme,
+                year,
+                bio,
+                skills,
+                username
+            ))
 
-    cursor.execute("""
-        UPDATE students
-        SET
-            name = ?,
-            programme = ?,
-            year = ?,
-            bio = ?,
-            skills = ?
-        WHERE username = ?
-    """, (
-        name.strip(),
-        programme.strip(),
-        int(year),
-        bio,
-        skills,
-        username
-    ))
-
-    updated = cursor.rowcount > 0
-    connection.commit()
-    connection.close()
-
-    return updated
+            return cursor.rowcount > 0
 
 
 def update_profile_picture(username, image_path):
-    connection = connect_db()
-    cursor = connection.cursor()
+    with _db() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                UPDATE students
+                SET profile_picture = %s
+                WHERE username = %s
+            """, (image_path, username))
 
-    cursor.execute("""
-        UPDATE students
-        SET profile_picture = ?
-        WHERE username = ?
-    """, (image_path, username))
-
-    updated = cursor.rowcount > 0
-    connection.commit()
-    connection.close()
-
-    return updated
+            return cursor.rowcount > 0
 
 
 def login_student(username, password):
     student = get_student(username)
 
-    if not student:
-        return False
-
-    return verify_password(password, student[1])
+    return bool(
+        student
+        and verify_password(password, student[1])
+    )
 
 
 # =========================================================
-# CONNECTION REQUESTS
+# CONNECTIONS AND REQUESTS
 # =========================================================
 
 def send_request(sender, receiver):
-    connection = connect_db()
-    cursor = connection.cursor()
-
-    if sender == receiver:
-        connection.close()
-        return False
-
-    cursor.execute("""
-        SELECT username FROM students
-        WHERE username IN (?, ?)
-    """, (sender, receiver))
-
-    if len(cursor.fetchall()) != 2:
-        connection.close()
-        return False
-
-    first, second = sorted([sender, receiver])
-
-    cursor.execute("""
-        SELECT 1 FROM connections
-        WHERE student1 = ? AND student2 = ?
-    """, (first, second))
-
-    if cursor.fetchone():
-        connection.close()
-        return False
-
-    cursor.execute("""
-        SELECT 1 FROM pending_requests
-        WHERE (sender = ? AND receiver = ?)
-        OR (sender = ? AND receiver = ?)
-    """, (sender, receiver, receiver, sender))
-
-    if cursor.fetchone():
-        connection.close()
+    if not sender or not receiver or sender == receiver:
         return False
 
     try:
-        cursor.execute("""
-            INSERT INTO pending_requests
-            (sender, receiver)
-            VALUES (?, ?)
-        """, (sender, receiver))
+        with _db() as connection:
+            with connection.cursor() as cursor:
 
-        connection.commit()
+                cursor.execute("""
+                    SELECT username
+                    FROM students
+                    WHERE username IN (%s, %s)
+                """, (sender, receiver))
+
+                if len(cursor.fetchall()) != 2:
+                    return False
+
+                first, second = sorted((sender, receiver))
+
+                cursor.execute("""
+                    SELECT 1
+                    FROM connections
+                    WHERE student1 = %s AND student2 = %s
+                """, (first, second))
+
+                if cursor.fetchone():
+                    return False
+
+                cursor.execute("""
+                    SELECT 1
+                    FROM pending_requests
+                    WHERE
+                        (sender = %s AND receiver = %s)
+                        OR
+                        (sender = %s AND receiver = %s)
+                """, (sender, receiver, receiver, sender))
+
+                if cursor.fetchone():
+                    return False
+
+                cursor.execute("""
+                    INSERT INTO pending_requests
+                    (sender, receiver)
+                    VALUES (%s, %s)
+                """, (sender, receiver))
+
         return True
 
-    except sqlite3.IntegrityError:
+    except psycopg.IntegrityError:
         return False
-
-    finally:
-        connection.close()
 
 
 def accept_request(sender, receiver):
-    connection = connect_db()
-    cursor = connection.cursor()
-
-    cursor.execute("""
-        SELECT 1 FROM pending_requests
-        WHERE sender = ? AND receiver = ?
-    """, (sender, receiver))
-
-    if not cursor.fetchone():
-        connection.close()
-        return False
-
-    first, second = sorted([sender, receiver])
+    first, second = sorted((sender, receiver))
 
     try:
-        cursor.execute("""
-            INSERT OR IGNORE INTO connections
-            (student1, student2)
-            VALUES (?, ?)
-        """, (first, second))
+        with _db() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    SELECT 1
+                    FROM pending_requests
+                    WHERE sender = %s AND receiver = %s
+                    FOR UPDATE
+                """, (sender, receiver))
 
-        cursor.execute("""
-            DELETE FROM pending_requests
-            WHERE sender = ? AND receiver = ?
-        """, (sender, receiver))
+                if not cursor.fetchone():
+                    return False
 
-        connection.commit()
+                cursor.execute("""
+                    INSERT INTO connections
+                    (student1, student2)
+                    VALUES (%s, %s)
+                    ON CONFLICT DO NOTHING
+                """, (first, second))
+
+                cursor.execute("""
+                    DELETE FROM pending_requests
+                    WHERE sender = %s AND receiver = %s
+                """, (sender, receiver))
+
         return True
 
-    except sqlite3.Error:
-        connection.rollback()
+    except psycopg.Error:
         return False
-
-    finally:
-        connection.close()
 
 
 def reject_request(sender, receiver):
-    connection = connect_db()
-    cursor = connection.cursor()
+    with _db() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                DELETE FROM pending_requests
+                WHERE sender = %s AND receiver = %s
+            """, (sender, receiver))
 
-    cursor.execute("""
-        DELETE FROM pending_requests
-        WHERE sender = ? AND receiver = ?
-    """, (sender, receiver))
-
-    deleted = cursor.rowcount > 0
-    connection.commit()
-    connection.close()
-
-    return deleted
+            return cursor.rowcount > 0
 
 
 def cancel_request(sender, receiver):
@@ -1085,103 +908,84 @@ def cancel_request(sender, receiver):
 
 
 def remove_connection(student1, student2):
-    connection = connect_db()
-    cursor = connection.cursor()
+    first, second = sorted((student1, student2))
 
-    first, second = sorted([student1, student2])
+    with _db() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                DELETE FROM connections
+                WHERE student1 = %s AND student2 = %s
+            """, (first, second))
 
-    cursor.execute("""
-        DELETE FROM connections
-        WHERE student1 = ? AND student2 = ?
-    """, (first, second))
-
-    deleted = cursor.rowcount > 0
-    connection.commit()
-    connection.close()
-
-    return deleted
+            return cursor.rowcount > 0
 
 
 def get_connections(username):
-    connection = connect_db()
-    cursor = connection.cursor()
+    with _db() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT student2
+                FROM connections
+                WHERE student1 = %s
 
-    cursor.execute("""
-        SELECT student2 FROM connections
-        WHERE student1 = ?
+                UNION
 
-        UNION
+                SELECT student1
+                FROM connections
+                WHERE student2 = %s
+            """, (username, username))
 
-        SELECT student1 FROM connections
-        WHERE student2 = ?
-    """, (username, username))
-
-    result = cursor.fetchall()
-    connection.close()
-
-    return {row[0] for row in result}
+            return {row[0] for row in cursor.fetchall()}
 
 
 def get_pending_requests(username):
-    connection = connect_db()
-    cursor = connection.cursor()
+    with _db() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT sender
+                FROM pending_requests
+                WHERE receiver = %s
+                ORDER BY sender
+            """, (username,))
 
-    cursor.execute("""
-        SELECT sender
-        FROM pending_requests
-        WHERE receiver = ?
-    """, (username,))
-
-    result = cursor.fetchall()
-    connection.close()
-
-    return [row[0] for row in result]
+            return [row[0] for row in cursor.fetchall()]
 
 
 def get_sent_requests(username):
-    connection = connect_db()
-    cursor = connection.cursor()
+    with _db() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT receiver
+                FROM pending_requests
+                WHERE sender = %s
+                ORDER BY receiver
+            """, (username,))
 
-    cursor.execute("""
-        SELECT receiver
-        FROM pending_requests
-        WHERE sender = ?
-    """, (username,))
-
-    result = cursor.fetchall()
-    connection.close()
-
-    return [row[0] for row in result]
+            return [row[0] for row in cursor.fetchall()]
 
 
 def get_all_students():
-    connection = connect_db()
-    cursor = connection.cursor()
+    with _db() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT username
+                FROM students
+                ORDER BY username
+            """)
 
-    cursor.execute("""
-        SELECT username
-        FROM students
-    """)
-
-    result = cursor.fetchall()
-    connection.close()
-
-    return [row[0] for row in result]
+            return [row[0] for row in cursor.fetchall()]
 
 
 def get_all_connections():
-    connection = connect_db()
-    cursor = connection.cursor()
+    with _db() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT student1, student2
+                FROM connections
+                ORDER BY student1, student2
+            """)
 
-    cursor.execute("""
-        SELECT student1, student2
-        FROM connections
-    """)
-
-    result = cursor.fetchall()
-    connection.close()
-
-    return result
+            return cursor.fetchall()
 
 
 # =========================================================
@@ -1189,59 +993,53 @@ def get_all_connections():
 # =========================================================
 
 def add_post(username, content, image_path=None):
-    if not content.strip() and not image_path:
+    content = (content or "").strip()
+
+    if not content and not image_path:
         return False
 
-    connection = connect_db()
-    cursor = connection.cursor()
-
-    cursor.execute("""
-        INSERT INTO posts
-        (username, content, created_at, image_path)
-        VALUES (?, ?, ?, ?)
-    """, (
-        username,
-        content,
-        datetime.now().isoformat(timespec="seconds"),
-        image_path
-    ))
-
-    connection.commit()
-    connection.close()
+    with _db() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                INSERT INTO posts
+                (username, content, created_at, image_path)
+                VALUES (%s, %s, %s, %s)
+            """, (
+                username,
+                content,
+                datetime.now().isoformat(timespec="seconds"),
+                image_path
+            ))
 
     return True
 
 
 def get_all_posts():
-    connection = connect_db()
-    cursor = connection.cursor()
+    with _db() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT
+                    post_id,
+                    username,
+                    content,
+                    created_at,
+                    image_path
+                FROM posts
+                ORDER BY created_at DESC, post_id DESC
+            """)
 
-    cursor.execute("""
-        SELECT post_id, username, content, created_at, image_path
-        FROM posts
-        ORDER BY created_at DESC
-    """)
-
-    posts = cursor.fetchall()
-    connection.close()
-
-    return posts
+            return cursor.fetchall()
 
 
 def delete_post(post_id, username):
-    connection = connect_db()
-    cursor = connection.cursor()
+    with _db() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                DELETE FROM posts
+                WHERE post_id = %s AND username = %s
+            """, (post_id, username))
 
-    cursor.execute("""
-        DELETE FROM posts
-        WHERE post_id = ? AND username = ?
-    """, (post_id, username))
-
-    deleted = cursor.rowcount > 0
-    connection.commit()
-    connection.close()
-
-    return deleted
+            return cursor.rowcount > 0
 
 
 # =========================================================
@@ -1249,72 +1047,57 @@ def delete_post(post_id, username):
 # =========================================================
 
 def toggle_post_like(post_id, username):
-    connection = connect_db()
-    cursor = connection.cursor()
+    with _db() as connection:
+        with connection.cursor() as cursor:
 
-    cursor.execute("""
-        SELECT 1 FROM post_likes
-        WHERE post_id = ? AND username = ?
-    """, (post_id, username))
+            cursor.execute("""
+                DELETE FROM post_likes
+                WHERE post_id = %s AND username = %s
+                RETURNING post_id
+            """, (post_id, username))
 
-    liked = cursor.fetchone() is not None
+            if cursor.fetchone():
+                return False
 
-    if liked:
-        cursor.execute("""
-            DELETE FROM post_likes
-            WHERE post_id = ? AND username = ?
-        """, (post_id, username))
+            cursor.execute("""
+                INSERT INTO post_likes
+                (post_id, username, created_at)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (post_id, username) DO NOTHING
+                RETURNING post_id
+            """, (
+                post_id,
+                username,
+                datetime.now().isoformat(timespec="seconds")
+            ))
 
-        connection.commit()
-        connection.close()
-        return False
-
-    cursor.execute("""
-        INSERT OR IGNORE INTO post_likes
-        (post_id, username, created_at)
-        VALUES (?, ?, ?)
-    """, (
-        post_id,
-        username,
-        datetime.now().isoformat(timespec="seconds")
-    ))
-
-    connection.commit()
-    connection.close()
-
-    return True
+            return cursor.fetchone() is not None
 
 
 def get_post_like_count(post_id):
-    connection = connect_db()
-    cursor = connection.cursor()
+    with _db() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT COUNT(*)
+                FROM post_likes
+                WHERE post_id = %s
+            """, (post_id,))
 
-    cursor.execute("""
-        SELECT COUNT(*)
-        FROM post_likes
-        WHERE post_id = ?
-    """, (post_id,))
-
-    count = cursor.fetchone()[0]
-    connection.close()
-
-    return count
+            return cursor.fetchone()[0]
 
 
 def user_liked_post(post_id, username):
-    connection = connect_db()
-    cursor = connection.cursor()
+    with _db() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM post_likes
+                    WHERE post_id = %s AND username = %s
+                )
+            """, (post_id, username))
 
-    cursor.execute("""
-        SELECT 1
-        FROM post_likes
-        WHERE post_id = ? AND username = ?
-    """, (post_id, username))
-
-    result = cursor.fetchone() is not None
-    connection.close()
-
-    return result
+            return cursor.fetchone()[0]
 
 
 # =========================================================
@@ -1327,270 +1110,188 @@ def add_comment(post_id, username, comment_text):
     if not comment_text:
         return False
 
-    connection = connect_db()
-    cursor = connection.cursor()
-
-    cursor.execute("""
-        INSERT INTO post_comments
-        (post_id, username, comment_text, created_at)
-        VALUES (?, ?, ?, ?)
-    """, (
-        post_id,
-        username,
-        comment_text,
-        datetime.now().isoformat(timespec="seconds")
-    ))
-
-    connection.commit()
-    connection.close()
+    with _db() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                INSERT INTO post_comments
+                (
+                    post_id,
+                    username,
+                    comment_text,
+                    created_at
+                )
+                VALUES (%s, %s, %s, %s)
+            """, (
+                post_id,
+                username,
+                comment_text,
+                datetime.now().isoformat(timespec="seconds")
+            ))
 
     return True
 
 
 def get_post_comments(post_id):
-    connection = connect_db()
-    cursor = connection.cursor()
+    with _db() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT
+                    comment_id,
+                    username,
+                    comment_text,
+                    created_at
+                FROM post_comments
+                WHERE post_id = %s
+                ORDER BY comment_id
+            """, (post_id,))
 
-    cursor.execute("""
-        SELECT comment_id, username, comment_text, created_at
-        FROM post_comments
-        WHERE post_id = ?
-        ORDER BY created_at ASC, comment_id ASC
-    """, (post_id,))
-
-    comments = cursor.fetchall()
-    connection.close()
-
-    return comments
+            return cursor.fetchall()
 
 
 def delete_comment(comment_id, username):
-    connection = connect_db()
-    cursor = connection.cursor()
+    with _db() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                DELETE FROM post_comments
+                WHERE comment_id = %s AND username = %s
+            """, (comment_id, username))
 
-    cursor.execute("""
-        DELETE FROM post_comments
-        WHERE comment_id = ? AND username = ?
-    """, (comment_id, username))
-
-    deleted = cursor.rowcount > 0
-    connection.commit()
-    connection.close()
-
-    return deleted
+            return cursor.rowcount > 0
 
 
 # =========================================================
-# ADMIN STATISTICS AND MODERATION
+# ADMIN DASHBOARD AND MODERATION
 # =========================================================
 
 def get_admin_statistics():
-    connection = connect_db()
-    cursor = connection.cursor()
+    with _db() as connection:
+        with connection.cursor() as cursor:
 
-    cursor.execute("SELECT COUNT(*) FROM students")
-    students = cursor.fetchone()[0]
+            queries = {
+                "students": "SELECT COUNT(*) FROM students",
+                "connections": "SELECT COUNT(*) FROM connections",
+                "posts": "SELECT COUNT(*) FROM posts",
+                "likes": "SELECT COUNT(*) FROM post_likes",
+                "comments": "SELECT COUNT(*) FROM post_comments",
+                "verified": """
+                    SELECT COUNT(*) FROM students WHERE verified = 1
+                """,
+                "unused_records": """
+                    SELECT COUNT(*) FROM verified_students
+                    WHERE registered_username IS NULL
+                """
+            }
 
-    cursor.execute("SELECT COUNT(*) FROM connections")
-    connections = cursor.fetchone()[0]
+            statistics = {}
 
-    cursor.execute("SELECT COUNT(*) FROM posts")
-    posts = cursor.fetchone()[0]
+            for key, query in queries.items():
+                cursor.execute(query)
+                statistics[key] = cursor.fetchone()[0]
 
-    cursor.execute("SELECT COUNT(*) FROM post_likes")
-    likes = cursor.fetchone()[0]
-
-    cursor.execute("SELECT COUNT(*) FROM post_comments")
-    comments = cursor.fetchone()[0]
-
-    cursor.execute("""
-        SELECT COUNT(*)
-        FROM students
-        WHERE verified = 1
-    """)
-    verified = cursor.fetchone()[0]
-
-    cursor.execute("""
-        SELECT COUNT(*)
-        FROM verified_students
-        WHERE registered_username IS NULL
-    """)
-    unused_records = cursor.fetchone()[0]
-
-    connection.close()
-
-    return {
-        "students": students,
-        "connections": connections,
-        "posts": posts,
-        "likes": likes,
-        "comments": comments,
-        "verified": verified,
-        "unused_records": unused_records
-    }
+            return statistics
 
 
 def get_all_students_details():
-    connection = connect_db()
-    cursor = connection.cursor()
+    with _db() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT
+                    username,
+                    name,
+                    programme,
+                    year,
+                    bio,
+                    skills,
+                    profile_picture,
+                    registration_number,
+                    category,
+                    verified
+                FROM students
+                ORDER BY LOWER(name)
+            """)
 
-    cursor.execute("""
-        SELECT
-            username,
-            name,
-            programme,
-            year,
-            bio,
-            skills,
-            profile_picture,
-            registration_number,
-            category,
-            verified
-        FROM students
-        ORDER BY name COLLATE NOCASE
-    """)
-
-    students = cursor.fetchall()
-    connection.close()
-
-    return students
+            return cursor.fetchall()
 
 
 def get_all_posts_admin():
-    connection = connect_db()
-    cursor = connection.cursor()
-
-    cursor.execute("""
-        SELECT post_id, username, content, created_at, image_path
-        FROM posts
-        ORDER BY created_at DESC
-    """)
-
-    posts = cursor.fetchall()
-    connection.close()
-
-    return posts
+    return get_all_posts()
 
 
 def delete_post_admin(post_id):
-    connection = connect_db()
-    cursor = connection.cursor()
+    with _db() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                DELETE FROM posts
+                WHERE post_id = %s
+            """, (post_id,))
 
-    cursor.execute("""
-        DELETE FROM posts
-        WHERE post_id = ?
-    """, (post_id,))
-
-    deleted = cursor.rowcount > 0
-    connection.commit()
-    connection.close()
-
-    return deleted
+            return cursor.rowcount > 0
 
 
 def get_all_comments_admin():
-    connection = connect_db()
-    cursor = connection.cursor()
+    with _db() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT
+                    comment_id,
+                    post_id,
+                    username,
+                    comment_text,
+                    created_at
+                FROM post_comments
+                ORDER BY comment_id DESC
+            """)
 
-    cursor.execute("""
-        SELECT
-            comment_id,
-            post_id,
-            username,
-            comment_text,
-            created_at
-        FROM post_comments
-        ORDER BY created_at DESC
-    """)
-
-    comments = cursor.fetchall()
-    connection.close()
-
-    return comments
+            return cursor.fetchall()
 
 
 def delete_comment_admin(comment_id):
-    connection = connect_db()
-    cursor = connection.cursor()
+    with _db() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                DELETE FROM post_comments
+                WHERE comment_id = %s
+            """, (comment_id,))
 
-    cursor.execute("""
-        DELETE FROM post_comments
-        WHERE comment_id = ?
-    """, (comment_id,))
-
-    deleted = cursor.rowcount > 0
-    connection.commit()
-    connection.close()
-
-    return deleted
+            return cursor.rowcount > 0
 
 
 def delete_student_admin(username):
-    connection = connect_db()
-    cursor = connection.cursor()
+    try:
+        with _db() as connection:
+            with connection.cursor() as cursor:
 
-    cursor.execute("""
-        SELECT registration_number
-        FROM students
-        WHERE username = ?
-    """, (username,))
+                cursor.execute("""
+                    SELECT registration_number
+                    FROM students
+                    WHERE username = %s
+                    FOR UPDATE
+                """, (username,))
 
-    result = cursor.fetchone()
+                student = cursor.fetchone()
 
-    if not result:
-        connection.close()
+                if not student:
+                    return False
+
+                registration_number = student[0]
+
+                # Release the official verification claim.
+                if registration_number:
+                    cursor.execute("""
+                        UPDATE verified_students
+                        SET registered_username = NULL
+                        WHERE registration_number = %s
+                        AND registered_username = %s
+                    """, (registration_number, username))
+
+                # Delete student. Foreign-key cascades remove
+                # associated posts, likes, comments and connections.
+                cursor.execute("""
+                    DELETE FROM students
+                    WHERE username = %s
+                """, (username,))
+
+                return cursor.rowcount > 0
+
+    except psycopg.Error:
         return False
-
-    registration_number = result[0]
-
-    cursor.execute("""
-        DELETE FROM posts
-        WHERE username = ?
-    """, (username,))
-
-    cursor.execute("""
-        DELETE FROM post_likes
-        WHERE username = ?
-    """, (username,))
-
-    cursor.execute("""
-        DELETE FROM post_comments
-        WHERE username = ?
-    """, (username,))
-
-    cursor.execute("""
-        DELETE FROM pending_requests
-        WHERE sender = ? OR receiver = ?
-    """, (username, username))
-
-    cursor.execute("""
-        DELETE FROM connections
-        WHERE student1 = ? OR student2 = ?
-    """, (username, username))
-
-    cursor.execute("""
-        DELETE FROM students
-        WHERE username = ?
-    """, (username,))
-
-    if registration_number:
-        cursor.execute("""
-            UPDATE verified_students
-            SET registered_username = NULL
-            WHERE registration_number = ?
-            AND registered_username = ?
-        """, (registration_number, username))
-
-    connection.commit()
-    connection.close()
-
-    return True
-
-
-# Initialize tables on import
-create_tables()
-
-
-if __name__ == "__main__":
-    print("CampusConnect database initialized.")
-    print("Database:", DB_PATH)

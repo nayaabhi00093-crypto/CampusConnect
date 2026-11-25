@@ -1,3 +1,5 @@
+import boto3
+from botocore.config import Config
 import streamlit as st
 import database
 import graph
@@ -26,9 +28,24 @@ PROFILE_FOLDER.mkdir(parents=True, exist_ok=True)
 POST_FOLDER.mkdir(parents=True, exist_ok=True)
 
 
+
 # =========================================================
-# IMAGE UTILITIES
+# IMAGE UTILITIES - SUPABASE STORAGE
 # =========================================================
+
+@st.cache_resource
+def get_storage_client():
+    storage = st.secrets["storage"]
+
+    return boto3.client(
+        "s3",
+        endpoint_url=storage["endpoint_url"],
+        region_name=storage["region"],
+        aws_access_key_id=storage["access_key_id"],
+        aws_secret_access_key=storage["secret_access_key"],
+        config=Config(signature_version="s3v4")
+    )
+
 
 def save_uploaded_image(uploaded_file, folder):
     if uploaded_file is None:
@@ -36,7 +53,14 @@ def save_uploaded_image(uploaded_file, folder):
 
     extension = Path(uploaded_file.name).suffix.lower()
 
-    if extension not in [".jpg", ".jpeg", ".png", ".webp"]:
+    allowed_types = {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp"
+    }
+
+    if extension not in allowed_types:
         raise ValueError(
             "Please upload JPG, JPEG, PNG or WEBP."
         )
@@ -46,24 +70,87 @@ def save_uploaded_image(uploaded_file, folder):
     if len(image_data) > 5 * 1024 * 1024:
         raise ValueError("Image must be smaller than 5 MB.")
 
-    filename = uuid.uuid4().hex + extension
-    image_path = folder / filename
-    image_path.write_bytes(image_data)
+    # Verify that the uploaded file is actually an image.
+    try:
+        from PIL import Image
 
-    return str(image_path.relative_to(BASE_DIR))
+        image = Image.open(io.BytesIO(image_data))
+
+        expected_formats = {
+            ".jpg": "JPEG",
+            ".jpeg": "JPEG",
+            ".png": "PNG",
+            ".webp": "WEBP"
+        }
+
+        if image.format != expected_formats[extension]:
+            raise ValueError("Image format does not match its file extension.")
+
+        image.verify()
+
+    except ValueError:
+        raise
+
+    except Exception:
+        raise ValueError("The uploaded file is not a valid image.")
+
+    folder_name = Path(folder).name
+
+    if folder_name not in ("profiles", "posts"):
+        raise ValueError("Invalid image storage location.")
+
+    filename = uuid.uuid4().hex + extension
+    object_key = f"uploads/{folder_name}/{filename}"
+
+    storage = st.secrets["storage"]
+
+    try:
+        client = get_storage_client()
+
+        client.put_object(
+            Bucket=storage["bucket"],
+            Key=object_key,
+            Body=image_data,
+            ContentType=allowed_types[extension]
+        )
+
+    except Exception:
+        raise ValueError(
+            "Image upload failed. Please check your Storage configuration "
+            "and try again."
+        )
+
+    return object_key
 
 
 def get_image_path(relative_path):
     if not relative_path:
         return None
 
-    image_path = BASE_DIR / relative_path
+    object_key = str(relative_path).replace("\\", "/")
 
-    if image_path.exists() and image_path.is_file():
-        return image_path
+    # Keep compatibility with any existing local image files.
+    local_path = BASE_DIR / object_key
 
-    return None
+    if local_path.exists() and local_path.is_file():
+        return local_path
 
+    storage = st.secrets["storage"]
+
+    try:
+        client = get_storage_client()
+
+        return client.generate_presigned_url(
+            "get_object",
+            Params={
+                "Bucket": storage["bucket"],
+                "Key": object_key
+            },
+            ExpiresIn=3600
+        )
+
+    except Exception:
+        return None
 
 # =========================================================
 # DESIGN
