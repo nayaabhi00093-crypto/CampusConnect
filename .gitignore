@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.db
+*.sqlite
+*.sqlite3
+uploads/
+verified_students.csv
+.streamlit/secrets.toml
+.env
+.venv/
+venv/
